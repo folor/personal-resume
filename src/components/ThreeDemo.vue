@@ -667,6 +667,12 @@ function init() {
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.0;
   containerRef.value.appendChild(renderer.domElement);
+  // Prevent browser default touch behaviors so long-press + move works on mobile
+  renderer.domElement.style.touchAction = "none";
+  renderer.domElement.style.msTouchAction = "none";
+  renderer.domElement.style.userSelect = "none";
+  renderer.domElement.style.webkitUserSelect = "none";
+  renderer.domElement.style.webkitTapHighlightColor = "transparent";
 
   // 文字标签渲染器
   labelRenderer = new CSS2DRenderer();
