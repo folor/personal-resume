@@ -1,9 +1,24 @@
 <template>
-  <!-- 3D 场景容器，position:relative 用于叠加 CSS2D 文字层 -->
-  <div
-    ref="containerRef"
-    style="width: 100%; height: 650px; border: 1px solid #333; position: relative"
-  ></div>
+  <!-- 3D 场景容器，position:relative 用于叠加 CSS2D 文字层 / 工具栏 / HUD -->
+  <div ref="containerRef" class="bot-demo">
+    <div class="bot-toolbar">
+      <button :class="{ active: followCam }" @click="followCam = !followCam">跟随相机</button>
+      <button :class="{ active: wanderAI }" @click="wanderAI = !wanderAI">NPC 巡逻</button>
+      <button :class="{ active: isNight }" @click="toggleNight">
+        {{ isNight ? "☀️ 白天" : "🌙 夜晚" }}
+      </button>
+    </div>
+
+    <div class="bot-hud">
+      <span>⭐ 得分 <b>{{ score }}</b></span>
+      <span>🔮 能量球 <b>{{ itemCount }}</b></span>
+      <span>🕹️ WASD / 方向键移动</span>
+    </div>
+
+    <div v-if="loadingCount > 0" class="bot-loading">
+      模型加载中 {{ 3 - loadingCount }}/3 …
+    </div>
+  </div>
 </template>
 
 <script setup lang="ts">
@@ -12,7 +27,6 @@ import { ref, onMounted, onUnmounted } from "vue";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
-import { RGBELoader } from "three/examples/jsm/loaders/RGBELoader.js";
 // 后期处理
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
@@ -28,6 +42,12 @@ import {
 
 // ========== 基础场景引用 ==========
 const containerRef = ref<HTMLDivElement | null>(null);
+const score = ref(0);
+const itemCount = ref(0);
+const loadingCount = ref(3);
+const followCam = ref(false);
+const wanderAI = ref(true);
+const isNight = ref(false);
 
 let scene: THREE.Scene;
 let camera: THREE.PerspectiveCamera;
@@ -35,12 +55,17 @@ let renderer: THREE.WebGLRenderer;
 let labelRenderer: CSS2DRenderer;
 let controls: OrbitControls;
 let animationId: number | null = null;
+let resizeObserver: ResizeObserver | null = null;
+let disposed = false;
 const clock = new THREE.Clock();
 
 let composer: EffectComposer;
 let outlinePass: OutlinePass;
 let bloomPass: UnrealBloomPass;
 let ssaoPass: SSAOPass;
+let dirLight: THREE.DirectionalLight;
+let hemiLight: THREE.HemisphereLight;
+let rimLight: THREE.DirectionalLight;
 
 // ========== 模型相关 ==========
 interface ModelWrap {
@@ -49,15 +74,15 @@ interface ModelWrap {
   runAction?: THREE.AnimationAction;
   idleAction?: THREE.AnimationAction;
 }
-const modelWrapList: ModelWrap[] = [];
-const modelList: THREE.Group[] = [];
+let modelWrapList: ModelWrap[] = [];
+let modelList: THREE.Group[] = [];
 
 let selectedModel: THREE.Group | null = null;
-const originMaterialMap = new WeakMap<THREE.Mesh, THREE.Material | THREE.Material[]>();
 
 // ========== 头顶文字标签 ==========
 const labelMap = new Map<THREE.Group, CSS2DObject>();
 const labelTimeoutMap = new Map<THREE.Group, number>();
+const nameTagMap = new Map<THREE.Group, CSS2DObject>();
 const LABEL_DURATION = 1500;
 
 // ========== 弹跳动画队列 ==========
@@ -97,6 +122,29 @@ const dragOffset = new THREE.Vector2();
 
 // ========== 可拾取物品 ==========
 let pickupItemList: THREE.Mesh[] = [];
+const respawnTimers: number[] = [];
+const ITEM_COLORS = [0xffd700, 0x00ff88, 0xff66cc, 0x66aaff, 0xff8844];
+const ITEM_EMISSIVES = [0xffaa00, 0x00cc66, 0xcc3399, 0x3377dd, 0xcc5511];
+
+// ========== 障碍物 ==========
+interface Obstacle {
+  x: number;
+  z: number;
+  r: number;
+}
+let obstacleList: Obstacle[] = [];
+let obstacleMeshes: THREE.Mesh[] = [];
+const BOUND = 12;
+
+// ========== 键盘控制 ==========
+const keys = new Set<string>();
+let keyboardMoving = false;
+const KEY_MAP: Record<string, [number, number]> = {
+  w: [0, -1], arrowup: [0, -1],
+  s: [0, 1], arrowdown: [0, 1],
+  a: [-1, 0], arrowleft: [-1, 0],
+  d: [1, 0], arrowright: [1, 0],
+};
 
 // ========== 点击光圈特效 ==========
 interface ClickRipple {
@@ -124,6 +172,28 @@ let particlePool: ExplodeParticleItem[] = [];
 const POOL_SIZE = 220;
 let prevPointerPos = new THREE.Vector2();
 let pointerSpeed = 0;
+
+// ========== 昼夜主题 ==========
+const DAY = {
+  bg: 0xe6f4ff,
+  fog: 0xeaf4ff,
+  fogDensity: 0.012,
+  dirColor: 0xffffff,
+  dirIntensity: 1.3,
+  hemiIntensity: 0.7,
+  rimColor: 0x4da6ff,
+  bloom: 0.35,
+};
+const NIGHT = {
+  bg: 0x0a1226,
+  fog: 0x0a1226,
+  fogDensity: 0.02,
+  dirColor: 0x8899ff,
+  dirIntensity: 0.35,
+  hemiIntensity: 0.22,
+  rimColor: 0x3377ff,
+  bloom: 0.75,
+};
 
 function createOneParticle(): ExplodeParticleItem {
   const geo = new THREE.BufferGeometry();
@@ -286,29 +356,38 @@ function createClickRipple(x: number, z: number, targetModel: THREE.Group) {
   rippleList.push({ mesh: ring, targetModel, fading: false, fadeOpacity: 0.65 });
 }
 
-function createPickupItems() {
-  const itemConfigs = [
-    { pos: new THREE.Vector3(5, 0.5, 3), color: 0xffd700, emissive: 0xffaa00 },
-    { pos: new THREE.Vector3(-4, 0.5, 4), color: 0x00ff88, emissive: 0x00cc66 },
-    { pos: new THREE.Vector3(2, 0.5, -5), color: 0xff66cc, emissive: 0xcc3399 },
-    { pos: new THREE.Vector3(6, 0.5, -2), color: 0x66aaff, emissive: 0x3377dd },
-  ];
+// ========== 能量球（拾取物品）==========
+function randomItemPos(): THREE.Vector3 {
+  // 避开障碍物附近
+  for (let tryN = 0; tryN < 10; tryN++) {
+    const x = (Math.random() * 2 - 1) * (BOUND - 1);
+    const z = (Math.random() * 2 - 1) * (BOUND - 1);
+    const tooClose = obstacleList.some((o) => Math.hypot(o.x - x, o.z - z) < o.r + 1.2);
+    if (!tooClose) return new THREE.Vector3(x, 0.5, z);
+  }
+  return new THREE.Vector3(5, 0.5, 3);
+}
 
-  itemConfigs.forEach((cfg) => {
-    const geo = new THREE.SphereGeometry(0.35, 32, 32);
-    const mat = new THREE.MeshStandardMaterial({
-      color: cfg.color,
-      emissive: cfg.emissive,
-      emissiveIntensity: 0.7,
-      metalness: 0.9,
-      roughness: 0.15,
-    });
-    const item = new THREE.Mesh(geo, mat);
-    item.position.copy(cfg.pos);
-    item.castShadow = true;
-    scene.add(item);
-    pickupItemList.push(item);
+function spawnOneItem(idx?: number) {
+  const i = idx !== undefined ? idx % ITEM_COLORS.length : Math.floor(Math.random() * ITEM_COLORS.length);
+  const geo = new THREE.SphereGeometry(0.35, 32, 32);
+  const mat = new THREE.MeshStandardMaterial({
+    color: ITEM_COLORS[i],
+    emissive: ITEM_EMISSIVES[i],
+    emissiveIntensity: 0.7,
+    metalness: 0.9,
+    roughness: 0.15,
   });
+  const item = new THREE.Mesh(geo, mat);
+  item.position.copy(randomItemPos());
+  item.castShadow = true;
+  scene.add(item);
+  pickupItemList.push(item);
+  itemCount.value = pickupItemList.length;
+}
+
+function createPickupItems() {
+  for (let i = 0; i < 4; i++) spawnOneItem(i);
 }
 
 function removePickupItem(item: THREE.Mesh) {
@@ -317,8 +396,61 @@ function removePickupItem(item: THREE.Mesh) {
   scene.remove(item);
   item.geometry.dispose();
   item.material.dispose();
+  itemCount.value = pickupItemList.length;
 }
 
+function scheduleRespawn() {
+  const timer = window.setTimeout(() => {
+    const i = respawnTimers.indexOf(timer);
+    if (i > -1) respawnTimers.splice(i, 1);
+    if (!disposed) spawnOneItem();
+  }, 3500);
+  respawnTimers.push(timer);
+}
+
+// ========== 障碍物 ==========
+function createObstacles() {
+  const configs = [
+    { x: -6, z: -5, r: 0.9, h: 2.2 },
+    { x: 6, z: -6, r: 0.7, h: 1.6 },
+    { x: -5, z: 6, r: 0.8, h: 1.9 },
+    { x: 7, z: 5, r: 1.0, h: 2.6 },
+    { x: 0, z: -8, r: 0.6, h: 1.3 },
+  ];
+  configs.forEach((cfg) => {
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0x6fa8dc,
+      emissive: 0x2a6db5,
+      emissiveIntensity: 0.25,
+      metalness: 0.6,
+      roughness: 0.35,
+    });
+    const mesh = new THREE.Mesh(new THREE.CylinderGeometry(cfg.r, cfg.r, cfg.h, 24), mat);
+    mesh.position.set(cfg.x, cfg.h / 2, cfg.z);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    scene.add(mesh);
+    obstacleMeshes.push(mesh);
+    obstacleList.push({ x: cfg.x, z: cfg.z, r: cfg.r });
+  });
+}
+
+function resolveCollisions(model: THREE.Group) {
+  for (const ob of obstacleList) {
+    const dx = model.position.x - ob.x;
+    const dz = model.position.z - ob.z;
+    const dist = Math.hypot(dx, dz);
+    const minD = ob.r + 0.7;
+    if (dist < minD && dist > 0.0001) {
+      model.position.x = ob.x + (dx / dist) * minD;
+      model.position.z = ob.z + (dz / dist) * minD;
+    }
+  }
+  model.position.x = THREE.MathUtils.clamp(model.position.x, -BOUND, BOUND);
+  model.position.z = THREE.MathUtils.clamp(model.position.z, -BOUND, BOUND);
+}
+
+// ========== 头顶临时气泡 ==========
 function createModelLabel(
   model: THREE.Group,
   text: string,
@@ -342,7 +474,7 @@ function createModelLabel(
     transform: translateY(-4px);
   `;
   const label = new CSS2DObject(div);
-  label.position.set(0, 2.2, 0);
+  label.position.set(0, 3.0, 0);
   model.add(label);
   labelMap.set(model, label);
 
@@ -365,6 +497,24 @@ function removeModelLabel(model: THREE.Group) {
   }
 }
 
+// ========== 持久名牌 ==========
+function createNameTag(model: THREE.Group, name: string) {
+  const div = document.createElement("div");
+  div.className = "bot-tag";
+  div.textContent = name;
+  const label = new CSS2DObject(div);
+  label.position.set(0, 2.45, 0);
+  model.add(label);
+  nameTagMap.set(model, label);
+}
+
+function updateTagHighlight() {
+  nameTagMap.forEach((tag, model) => {
+    const el = tag.element as HTMLDivElement;
+    el.classList.toggle("selected", model === selectedModel);
+  });
+}
+
 function getModelWrap(group: THREE.Group): ModelWrap | undefined {
   return modelWrapList.find((item) => item.group === group);
 }
@@ -380,6 +530,15 @@ function playRun(model: THREE.Group, play: boolean) {
   }
 }
 
+function selectModel(model: THREE.Group) {
+  if (selectedModel === model) return;
+  selectedModel = model;
+  if (outlinePass) outlinePass.selectedObjects = [model];
+  moveTargetMap.delete(model);
+  removeRippleByModel(model);
+  updateTagHighlight();
+}
+
 // ========== 射线拾取 ==========
 const raycaster = new THREE.Raycaster();
 const mouse = new THREE.Vector2();
@@ -388,7 +547,7 @@ let isDragging = false;
 const tempWorldPoint = new THREE.Vector3();
 
 function onMouseDown(e: MouseEvent) {
-  if (!renderer.domElement || modelList.length === 0) return;
+  if (!renderer?.domElement || modelList.length === 0) return;
   const rect = renderer.domElement.getBoundingClientRect();
   mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
   mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
@@ -437,7 +596,7 @@ function onMouseDown(e: MouseEvent) {
 }
 
 function onMouseMove(e: MouseEvent) {
-  if (!renderer.domElement) return;
+  if (!renderer?.domElement) return;
   const rect = renderer.domElement.getBoundingClientRect();
   mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
   mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
@@ -455,6 +614,7 @@ function onMouseMove(e: MouseEvent) {
       removeRippleByModel(selectedModel);
       playRun(selectedModel, false);
       controls.enabled = false;
+      updateTagHighlight();
       dragOffset.x = selectedModel.position.x - downHitPoint!.x;
       dragOffset.y = selectedModel.position.z - downHitPoint!.z;
     }
@@ -464,9 +624,11 @@ function onMouseMove(e: MouseEvent) {
     raycaster.setFromCamera(mouse, camera);
     const intersectPoint = new THREE.Vector3();
     raycaster.ray.intersectPlane(dragPlane, intersectPoint);
-    selectedModel.position.x = intersectPoint.x + dragOffset.x;
-    selectedModel.position.z = intersectPoint.z + dragOffset.y;
-    if (selectedModel.position.y < 0) selectedModel.position.y = 0;
+    if (intersectPoint) {
+      selectedModel.position.x = THREE.MathUtils.clamp(intersectPoint.x + dragOffset.x, -BOUND, BOUND);
+      selectedModel.position.z = THREE.MathUtils.clamp(intersectPoint.z + dragOffset.y, -BOUND, BOUND);
+      if (selectedModel.position.y < 0) selectedModel.position.y = 0;
+    }
   }
 
   const SPEED_THRESHOLD = 0.02;
@@ -496,10 +658,7 @@ function onMouseUp(e: MouseEvent) {
     if (downHitItem) {
       const targetModel = selectedModel || modelList[0];
       if (targetModel) {
-        if (!selectedModel) {
-          selectedModel = targetModel;
-          outlinePass.selectedObjects = [selectedModel];
-        }
+        if (!selectedModel) selectModel(targetModel);
         createModelLabel(targetModel, "去捡东西");
         createClickRipple(downHitItem.position.x, downHitItem.position.z, targetModel);
         moveTargetMap.set(targetModel, {
@@ -521,12 +680,7 @@ function onMouseUp(e: MouseEvent) {
           progress: 0,
         });
       } else {
-        clearHighlight();
-        if (selectedModel) removeModelLabel(selectedModel);
-        selectedModel = downHitModel;
-        outlinePass.selectedObjects = [selectedModel];
-        moveTargetMap.delete(selectedModel);
-        removeRippleByModel(selectedModel);
+        selectModel(downHitModel);
         playRun(selectedModel, false);
         createModelLabel(selectedModel, "你好~");
         modelAnimQueue.push({
@@ -541,15 +695,12 @@ function onMouseUp(e: MouseEvent) {
     } else if (downGroundPoint) {
       const targetModel = selectedModel || modelList[0];
       if (targetModel) {
-        if (!selectedModel) {
-          selectedModel = targetModel;
-          outlinePass.selectedObjects = [selectedModel];
-        }
+        if (!selectedModel) selectModel(targetModel);
         createModelLabel(targetModel, "我来啦！！！");
         createClickRipple(downGroundPoint.x, downGroundPoint.z, targetModel);
         moveTargetMap.set(targetModel, {
-          x: downGroundPoint.x,
-          z: downGroundPoint.z,
+          x: THREE.MathUtils.clamp(downGroundPoint.x, -BOUND, BOUND),
+          z: THREE.MathUtils.clamp(downGroundPoint.z, -BOUND, BOUND),
         });
         playRun(targetModel, true);
       }
@@ -565,116 +716,88 @@ function onMouseUp(e: MouseEvent) {
   controls.enabled = true;
 }
 
+// ========== 键盘 ==========
+function onKeyDown(e: KeyboardEvent) {
+  const k = e.key.toLowerCase();
+  if (KEY_MAP[k]) {
+    keys.add(k);
+    e.preventDefault();
+  }
+}
+function onKeyUp(e: KeyboardEvent) {
+  keys.delete(e.key.toLowerCase());
+}
+
 // ========== 触屏事件兼容 ==========
 function onTouchStart(e: TouchEvent) {
   e.preventDefault();
   const t = e.touches[0];
-  const mouseEvt = new MouseEvent("mousedown", {
-    clientX: t.clientX,
-    clientY: t.clientY,
-  });
-  onMouseDown(mouseEvt);
+  onMouseDown(new MouseEvent("mousedown", { clientX: t.clientX, clientY: t.clientY }));
 }
 function onTouchMove(e: TouchEvent) {
   e.preventDefault();
   const t = e.touches[0];
-  const mouseEvt = new MouseEvent("mousemove", {
-    clientX: t.clientX,
-    clientY: t.clientY,
-  });
-  onMouseMove(mouseEvt);
+  onMouseMove(new MouseEvent("mousemove", { clientX: t.clientX, clientY: t.clientY }));
 }
 function onTouchEnd(e: TouchEvent) {
   e.preventDefault();
-  const mouseEvt = new MouseEvent("mouseup", { clientX: 0, clientY: 0 });
-  onMouseUp(mouseEvt);
+  onMouseUp(new MouseEvent("mouseup", { clientX: 0, clientY: 0 }));
 }
 
-function setHighlight(obj: THREE.Group) {
-  obj.traverse((mesh) => {
-    const m = mesh as THREE.Mesh;
-    if (!m.isMesh) return;
-    if (!originMaterialMap.has(m)) {
-      originMaterialMap.set(m, m.material);
-    }
-    const originMat = m.material as THREE.MeshStandardMaterial;
-    const highlightMat = new THREE.MeshStandardMaterial({
-      color: originMat.color,
-      map: originMat.map,
-      emissive: 0xffdd00,
-      emissiveIntensity: 0.35,
-    });
-    m.material = highlightMat;
-  });
-}
-
-function clearHighlight() {
-  modelList.forEach((group) => {
-    group.traverse((mesh) => {
-      const m = mesh as THREE.Mesh;
-      if (!m.isMesh) return;
-      if (originMaterialMap.has(m)) {
-        m.material = originMaterialMap.get(m)!;
-      }
-    });
-  });
-}
-
-// ========== 加载HDRI环境贴图 ==========
-function loadHDRI() {
-  const pmremGenerator = new THREE.PMREMGenerator(renderer);
-  pmremGenerator.compileEquirectangularShader();
-
-  const rgbeLoader = new RGBELoader();
-  // 科技感室内HDR，免费可商用
-  rgbeLoader.load(
-    "https://threejs.org/examples/textures/equirectangular/royal_esplanade_1k.hdr",
-    (texture) => {
-      const envMap = pmremGenerator.fromEquirectangular(texture).texture;
-      scene.environment = envMap;
-      texture.dispose();
-      pmremGenerator.dispose();
-      console.log("HDRI环境贴图加载完成");
-    },
-    undefined,
-    (err) => {
-      console.warn("HDRI加载失败，使用默认环境:", err);
-    }
-  );
+// ========== 昼夜切换 ==========
+function toggleNight() {
+  isNight.value = !isNight.value;
+  const theme = isNight.value ? NIGHT : DAY;
+  scene.background = new THREE.Color(theme.bg);
+  scene.fog = new THREE.FogExp2(theme.fog, theme.fogDensity);
+  dirLight.color.set(theme.dirColor);
+  dirLight.intensity = theme.dirIntensity;
+  hemiLight.intensity = theme.hemiIntensity;
+  rimLight.color.set(theme.rimColor);
+  bloomPass.strength = theme.bloom;
 }
 
 // ========== 初始化场景 ==========
 function init() {
   if (!containerRef.value) return;
+  disposed = false;
+  clock.getDelta(); // 丢弃与上次挂载之间的巨大间隔
+
   const w = containerRef.value.clientWidth;
   const h = containerRef.value.clientHeight;
 
-  // 场景：蓝白渐变 + 柔和雾化
-  scene = new THREE.Scene();
-  scene.background = new THREE.Color(0xe6f4ff);
-  scene.fog = new THREE.FogExp2(0xeaf4ff, 0.012);
+  // 重置跨挂载残留状态
+  selectedModel = null;
+  modelWrapList = [];
+  modelList = [];
+  pickupItemList = [];
+  obstacleList = [];
+  obstacleMeshes = [];
+  rippleList = [];
+  modelAnimQueue = [];
+  moveTargetMap.clear();
+  nameTagMap.clear();
+  keys.clear();
 
-  // 相机
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(DAY.bg);
+  scene.fog = new THREE.FogExp2(DAY.fog, DAY.fogDensity);
+
   camera = new THREE.PerspectiveCamera(75, w / h, 0.1, 2000);
   camera.position.set(12, 12, 12);
 
-  // WebGL 渲染器：开启色调映射，配合Bloom效果更好
   renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setSize(w, h);
-  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.0;
   containerRef.value.appendChild(renderer.domElement);
-  // Prevent browser default touch behaviors so long-press + move works on mobile
   renderer.domElement.style.touchAction = "none";
-  renderer.domElement.style.msTouchAction = "none";
   renderer.domElement.style.userSelect = "none";
-  renderer.domElement.style.webkitUserSelect = "none";
   renderer.domElement.style.webkitTapHighlightColor = "transparent";
 
-  // 文字标签渲染器
   labelRenderer = new CSS2DRenderer();
   labelRenderer.setSize(w, h);
   labelRenderer.domElement.style.position = "absolute";
@@ -684,7 +807,7 @@ function init() {
   containerRef.value.appendChild(labelRenderer.domElement);
 
   // 灯光
-  const dirLight = new THREE.DirectionalLight(0xffffff, 1.3);
+  dirLight = new THREE.DirectionalLight(DAY.dirColor, DAY.dirIntensity);
   dirLight.position.set(12, 22, 12);
   dirLight.castShadow = true;
   dirLight.shadow.mapSize.set(2048, 2048);
@@ -697,11 +820,10 @@ function init() {
   dirLight.shadow.bias = -0.0001;
   scene.add(dirLight);
 
-  // 半球光：模拟天空+地面反射，替代HDRI，不需要外部资源
-  const hemiLight = new THREE.HemisphereLight(0xb8dcff, 0xd7ecff, 0.7);
+  hemiLight = new THREE.HemisphereLight(0xb8dcff, 0xd7ecff, DAY.hemiIntensity);
   scene.add(hemiLight);
 
-  const rimLight = new THREE.DirectionalLight(0x4da6ff, 0.4);
+  rimLight = new THREE.DirectionalLight(DAY.rimColor, 0.4);
   rimLight.position.set(-10, 8, 10);
   scene.add(rimLight);
 
@@ -726,17 +848,27 @@ function init() {
   gridFine.position.y = 0.015;
   scene.add(gridFine);
 
-  const axes = new THREE.AxesHelper(6);
-  axes.material.opacity = 0.75;
-  axes.material.transparent = true;
-  scene.add(axes);
+  // 边界提示框
+  const boundGeo = new THREE.PlaneGeometry(BOUND * 2, BOUND * 2);
+  const boundMat = new THREE.MeshBasicMaterial({
+    color: 0x4da6ff,
+    transparent: true,
+    opacity: 0.06,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+  const boundPlane = new THREE.Mesh(boundGeo, boundMat);
+  boundPlane.rotation.x = -Math.PI / 2;
+  boundPlane.position.y = 0.03;
+  scene.add(boundPlane);
 
   // 轨道控制器
   controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
   controls.dampingFactor = 0.05;
   controls.minDistance = 2;
-  controls.maxDistance = 120;
+  controls.maxDistance = 60;
+  controls.maxPolarAngle = Math.PI * 0.49;
 
   // 鼠标事件
   renderer.domElement.addEventListener("mousedown", onMouseDown);
@@ -749,14 +881,14 @@ function init() {
   renderer.domElement.addEventListener("touchmove", onTouchMove, { passive: false });
   renderer.domElement.addEventListener("touchend", onTouchEnd, { passive: false });
 
-  // ========== 后期处理管线 ==========
-  // 顺序：RenderPass → SSAO → Outline → Bloom → Output
-  composer = new EffectComposer(renderer);
+  // 键盘
+  window.addEventListener("keydown", onKeyDown);
+  window.addEventListener("keyup", onKeyUp);
 
-  // 1. 基础渲染
+  // ========== 后期处理管线 ==========
+  composer = new EffectComposer(renderer);
   composer.addPass(new RenderPass(scene, camera));
 
-  // 2. SSAO 环境光遮蔽（物体接触阴影，增强立体感）
   ssaoPass = new SSAOPass(scene, camera, w, h);
   ssaoPass.kernelRadius = 8;
   ssaoPass.minDistance = 0.005;
@@ -764,7 +896,6 @@ function init() {
   ssaoPass.output = SSAOPass.OUTPUT.Default;
   composer.addPass(ssaoPass);
 
-  // 3. 选中边缘光晕
   outlinePass = new OutlinePass(new THREE.Vector2(w, h), scene, camera);
   outlinePass.edgeStrength = 3.0;
   outlinePass.edgeGlow = 0.65;
@@ -774,140 +905,38 @@ function init() {
   outlinePass.hiddenEdgeColor.set(0x000000);
   composer.addPass(outlinePass);
 
-  // 4. Bloom 泛光（发光元素更炫）
-  bloomPass = new UnrealBloomPass(
-    new THREE.Vector2(w, h),
-    0.35, // strength 泛光强度
-    0.5, // radius 泛光半径
-    0.85 // threshold 亮度阈值（超过这个亮度才发光）
-  );
+  bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), DAY.bloom, 0.5, 0.85);
   composer.addPass(bloomPass);
 
-  // 5. 输出
   composer.addPass(new OutputPass());
 
-  // 加载HDRI环境贴图
-  // loadHDRI();
-
-  // 创建可拾取物品
+  // 场景内容
   createPickupItems();
-
-  // 初始化爆炸粒子池
+  createObstacles();
   initParticlePool();
 
-  // 加载 GLB 模型（带 run 动画）
-  loadModelWithAnim("/scene.glb", new THREE.Vector3(-3, 0, 0));
+  // ========== 加载 3 个角色 ==========
+  loadingCount.value = 3;
+  const charConfigs = [
+    { pos: new THREE.Vector3(-4, 0, 1), tint: 0xffffff, name: "小白" },
+    { pos: new THREE.Vector3(0, 0, 2.5), tint: 0x9fc8ff, name: "小蓝" },
+    { pos: new THREE.Vector3(4, 0, 1), tint: 0xffb3c8, name: "小粉" },
+  ];
+  charConfigs.forEach((cfg) => loadModelWithAnim("/scene.glb", cfg.pos, cfg.tint, cfg.name));
 
-  // ========== 动画循环 ==========
-  function animate() {
-    animationId = requestAnimationFrame(animate);
-    controls.update();
-    const delta = clock.getDelta();
-    const elapsed = clock.getElapsedTime();
+  // 尺寸监听（tab 切换 / 响应式均可靠）
+  resizeObserver = new ResizeObserver(() => onResize());
+  resizeObserver.observe(containerRef.value);
 
-    // 1. 骨骼动画
-    modelWrapList.forEach((wrap) => wrap.mixer.update(delta));
-
-    // 2. 模型呼吸缩放
-    const breathScale = BASE_SCALE + Math.sin(elapsed * BREATH_SPEED) * BREATH_AMPLITUDE;
-    modelList.forEach((model) => model.scale.set(breathScale, breathScale, breathScale));
-
-    // 3. 物品自转 + 浮动
-    pickupItemList.forEach((item, i) => {
-      item.rotation.y += delta * 2;
-      item.position.y = 0.5 + Math.sin(elapsed * 3 + i * 1.2) * 0.15;
-    });
-
-    // 4. 爆炸粒子
-    tickExplodeParticles();
-
-    // 5. 自动移动
-    moveTargetMap.forEach((target, model) => {
-      const dx = target.x - model.position.x;
-      const dz = target.z - model.position.z;
-      const distance = Math.sqrt(dx * dx + dz * dz);
-      if (distance < 0.05) {
-        model.position.x = target.x;
-        model.position.z = target.z;
-        moveTargetMap.delete(model);
-        playRun(model, false);
-
-        if (target.pickupItem) {
-          removePickupItem(target.pickupItem);
-          createModelLabel(model, "捡到物品");
-        }
-      } else {
-        const moveDistance = MOVE_SPEED * delta;
-        const ratio = Math.min(moveDistance / distance, 1);
-        model.position.x += dx * ratio;
-        model.position.z += dz * ratio;
-        model.rotation.y = Math.atan2(dx, dz);
-      }
-      if (model.position.y < 0) model.position.y = 0;
-    });
-
-    // 6. 弹跳动画
-    const speed = 0.042;
-    for (let i = modelAnimQueue.length - 1; i >= 0; i--) {
-      const item = modelAnimQueue[i];
-      item.progress += speed;
-      if (item.progress >= 1) {
-        item.progress = 1;
-        modelAnimQueue.splice(i, 1);
-      }
-      const bounceOffset = Math.sin(Math.PI * item.progress) * item.height;
-      item.model.position.y = item.originY + bounceOffset;
-      item.model.position.z = THREE.MathUtils.lerp(
-        item.originZ,
-        item.originZ + item.moveDistance,
-        item.progress
-      );
-    }
-
-    // 7. 光圈特效
-    for (let i = rippleList.length - 1; i >= 0; i--) {
-      const item = rippleList[i];
-      const stillMoving = moveTargetMap.has(item.targetModel);
-      if (stillMoving && !item.fading) {
-        const pulse = 1.0 + Math.sin(elapsed * 4) * 0.15;
-        item.mesh.scale.set(pulse, pulse, pulse);
-        item.mesh.material.opacity = 0.55 + Math.sin(elapsed * 4) * 0.1;
-      } else {
-        if (!item.fading) {
-          item.fading = true;
-          item.fadeOpacity = item.mesh.material.opacity;
-        }
-        item.fadeOpacity -= delta * 2.5;
-        item.mesh.material.opacity = Math.max(0, item.fadeOpacity);
-        item.mesh.scale.multiplyScalar(1 + delta * 0.8);
-        if (item.fadeOpacity <= 0) {
-          scene.remove(item.mesh);
-          item.mesh.geometry.dispose();
-          item.mesh.material.dispose();
-          rippleList.splice(i, 1);
-        }
-      }
-    }
-
-    // 8. Y 轴钳制
-    modelList.forEach((model) => {
-      if (model.position.y < 0) model.position.y = 0;
-    });
-
-    // 渲染
-    composer.render();
-    labelRenderer.render(scene, camera);
-  }
   animate();
-
-  window.addEventListener("resize", onWindowResize);
 }
 
-function loadModelWithAnim(url: string, pos: THREE.Vector3) {
+function loadModelWithAnim(url: string, pos: THREE.Vector3, tint: number, name: string) {
   const loader = new GLTFLoader();
   loader.load(
     url,
     (gltf) => {
+      if (disposed || !scene) return; // 组件可能已卸载
       const model = gltf.scene;
       model.position.copy(pos);
       if (model.position.y < 0) model.position.y = 0;
@@ -915,9 +944,25 @@ function loadModelWithAnim(url: string, pos: THREE.Vector3) {
       model.traverse((obj) => {
         obj.castShadow = true;
         obj.receiveShadow = true;
+        const m = obj as THREE.Mesh;
+        if (m.isMesh && m.material && tint !== 0xffffff) {
+          // 克隆材质独立着色，避免多个角色共享材质互相影响
+          if (Array.isArray(m.material)) {
+            m.material = m.material.map((s) => {
+              const c = s.clone();
+              c.color = new THREE.Color(tint);
+              return c;
+            });
+          } else {
+            const c = m.material.clone();
+            c.color = new THREE.Color(tint);
+            m.material = c;
+          }
+        }
       });
       scene.add(model);
       modelList.push(model);
+      createNameTag(model, name);
 
       const mixer = new THREE.AnimationMixer(model);
       let runAction: THREE.AnimationAction | undefined;
@@ -929,37 +974,214 @@ function loadModelWithAnim(url: string, pos: THREE.Vector3) {
         console.warn("⚠️未找到名为run的骨骼动画片段");
       }
       modelWrapList.push({ group: model, mixer, runAction });
+
+      loadingCount.value = Math.max(0, loadingCount.value - 1);
+
+      // 默认选中第一个加载完成的角色
+      if (!selectedModel) {
+        selectModel(model);
+        createModelLabel(model, "选中了我！");
+      }
     },
-    (p) => console.log(`加载进度 ${Math.round((p.loaded / p.total) * 100)}%`),
-    (err) => console.error("模型加载失败", err)
+    (p) => {
+      if (p.total) {
+        // 可选：控制台观察进度
+      }
+    },
+    (err) => {
+      console.error("模型加载失败", err);
+      loadingCount.value = Math.max(0, loadingCount.value - 1);
+    }
   );
 }
 
-function onWindowResize() {
-  if (!containerRef.value) return;
+function onResize() {
+  if (!containerRef.value || !renderer) return;
   const w = containerRef.value.clientWidth;
   const h = containerRef.value.clientHeight;
+  if (w === 0 || h === 0) return;
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
   renderer.setSize(w, h);
   composer.setSize(w, h);
   labelRenderer.setSize(w, h);
-  // SSAO和Bloom也要同步尺寸
   if (ssaoPass) ssaoPass.setSize(w, h);
   if (bloomPass) bloomPass.setSize(w, h);
 }
 
-function dispose() {
-  window.removeEventListener("resize", onWindowResize);
-  if (animationId !== null) cancelAnimationFrame(animationId);
+function animate() {
+  animationId = requestAnimationFrame(animate);
+  controls.update();
+  const delta = Math.min(clock.getDelta(), 0.05); // 防切页后巨大 delta
+  const elapsed = clock.getElapsedTime();
 
-  renderer.domElement.removeEventListener("mousedown", onMouseDown);
-  renderer.domElement.removeEventListener("mousemove", onMouseMove);
-  renderer.domElement.removeEventListener("mouseup", onMouseUp);
-  renderer.domElement.removeEventListener("mouseleave", onMouseUp);
-  renderer.domElement.removeEventListener("touchstart", onTouchStart);
-  renderer.domElement.removeEventListener("touchmove", onTouchMove);
-  renderer.domElement.removeEventListener("touchend", onTouchEnd);
+  // 1. 骨骼动画
+  modelWrapList.forEach((wrap) => wrap.mixer.update(delta));
+
+  // 2. 模型呼吸缩放
+  const breathScale = BASE_SCALE + Math.sin(elapsed * BREATH_SPEED) * BREATH_AMPLITUDE;
+  modelList.forEach((model) => model.scale.set(breathScale, breathScale, breathScale));
+
+  // 3. 物品自转 + 浮动
+  pickupItemList.forEach((item, i) => {
+    item.rotation.y += delta * 2;
+    item.position.y = 0.5 + Math.sin(elapsed * 3 + i * 1.2) * 0.15;
+  });
+
+  // 4. 爆炸粒子
+  tickExplodeParticles();
+
+  // 5. WASD 键盘控制选中角色
+  if (selectedModel && !isDragMode && modelList.includes(selectedModel)) {
+    let kx = 0;
+    let kz = 0;
+    keys.forEach((k) => {
+      const d = KEY_MAP[k];
+      if (d) {
+        kx += d[0];
+        kz += d[1];
+      }
+    });
+    if (kx !== 0 || kz !== 0) {
+      moveTargetMap.delete(selectedModel);
+      removeRippleByModel(selectedModel);
+      const len = Math.hypot(kx, kz);
+      const spd = MOVE_SPEED * 1.35 * delta;
+      selectedModel.position.x += (kx / len) * spd;
+      selectedModel.position.z += (kz / len) * spd;
+      selectedModel.rotation.y = Math.atan2(kx, kz);
+      playRun(selectedModel, true);
+      keyboardMoving = true;
+    } else if (keyboardMoving) {
+      keyboardMoving = false;
+      playRun(selectedModel, false);
+    }
+  }
+
+  // 6. NPC 自动巡逻
+  if (wanderAI.value) {
+    modelList.forEach((m) => {
+      if (m === selectedModel) return;
+      if (!moveTargetMap.has(m) && Math.random() < delta * 0.3) {
+        moveTargetMap.set(m, {
+          x: (Math.random() * 2 - 1) * (BOUND - 1),
+          z: (Math.random() * 2 - 1) * (BOUND - 1),
+        });
+        playRun(m, true);
+      }
+    });
+  }
+
+  // 7. 自动移动（点击目标 / 巡逻目标共用）
+  moveTargetMap.forEach((target, model) => {
+    const dx = target.x - model.position.x;
+    const dz = target.z - model.position.z;
+    const distance = Math.sqrt(dx * dx + dz * dz);
+    if (distance < 0.05) {
+      model.position.x = target.x;
+      model.position.z = target.z;
+      moveTargetMap.delete(model);
+      playRun(model, false);
+
+      if (target.pickupItem && pickupItemList.includes(target.pickupItem)) {
+        removePickupItem(target.pickupItem);
+        score.value += 1;
+        createModelLabel(model, `+1 得分 ${score.value}`);
+        spawnExplode(model.position.clone().setY(0.8), 0.8);
+        scheduleRespawn();
+      }
+    } else {
+      const moveDistance = MOVE_SPEED * delta;
+      const ratio = Math.min(moveDistance / distance, 1);
+      model.position.x += dx * ratio;
+      model.position.z += dz * ratio;
+      model.rotation.y = Math.atan2(dx, dz);
+    }
+    if (model.position.y < 0) model.position.y = 0;
+  });
+
+  // 8. 障碍碰撞 + 边界（所有角色）
+  modelList.forEach((model) => resolveCollisions(model));
+
+  // 9. 弹跳动画
+  const speed = 0.042;
+  for (let i = modelAnimQueue.length - 1; i >= 0; i--) {
+    const item = modelAnimQueue[i];
+    item.progress += speed;
+    if (item.progress >= 1) {
+      item.progress = 1;
+      modelAnimQueue.splice(i, 1);
+    }
+    const bounceOffset = Math.sin(Math.PI * item.progress) * item.height;
+    item.model.position.y = item.originY + bounceOffset;
+    item.model.position.z = THREE.MathUtils.lerp(
+      item.originZ,
+      item.originZ + item.moveDistance,
+      item.progress
+    );
+  }
+
+  // 10. 光圈特效
+  for (let i = rippleList.length - 1; i >= 0; i--) {
+    const item = rippleList[i];
+    const stillMoving = moveTargetMap.has(item.targetModel);
+    if (stillMoving && !item.fading) {
+      const pulse = 1.0 + Math.sin(elapsed * 4) * 0.15;
+      item.mesh.scale.set(pulse, pulse, pulse);
+      item.mesh.material.opacity = 0.55 + Math.sin(elapsed * 4) * 0.1;
+    } else {
+      if (!item.fading) {
+        item.fading = true;
+        item.fadeOpacity = item.mesh.material.opacity;
+      }
+      item.fadeOpacity -= delta * 2.5;
+      item.mesh.material.opacity = Math.max(0, item.fadeOpacity);
+      item.mesh.scale.multiplyScalar(1 + delta * 0.8);
+      if (item.fadeOpacity <= 0) {
+        scene.remove(item.mesh);
+        item.mesh.geometry.dispose();
+        item.mesh.material.dispose();
+        rippleList.splice(i, 1);
+      }
+    }
+  }
+
+  // 11. 跟随相机
+  if (followCam.value && selectedModel) {
+    const t = new THREE.Vector3(
+      selectedModel.position.x,
+      selectedModel.position.y + 1,
+      selectedModel.position.z
+    );
+    controls.target.lerp(t, 0.08);
+  }
+
+  // 12. Y 轴钳制
+  modelList.forEach((model) => {
+    if (model.position.y < 0) model.position.y = 0;
+  });
+
+  // 渲染
+  composer.render();
+  labelRenderer.render(scene, camera);
+}
+
+function dispose() {
+  disposed = true;
+  if (animationId !== null) cancelAnimationFrame(animationId);
+  resizeObserver?.disconnect();
+  window.removeEventListener("keydown", onKeyDown);
+  window.removeEventListener("keyup", onKeyUp);
+
+  if (renderer?.domElement) {
+    renderer.domElement.removeEventListener("mousedown", onMouseDown);
+    renderer.domElement.removeEventListener("mousemove", onMouseMove);
+    renderer.domElement.removeEventListener("mouseup", onMouseUp);
+    renderer.domElement.removeEventListener("mouseleave", onMouseUp);
+    renderer.domElement.removeEventListener("touchstart", onTouchStart);
+    renderer.domElement.removeEventListener("touchmove", onTouchMove);
+    renderer.domElement.removeEventListener("touchend", onTouchEnd);
+  }
 
   controls?.dispose();
   composer?.dispose();
@@ -967,10 +1189,15 @@ function dispose() {
 
   disposeParticlePool();
 
+  respawnTimers.forEach((t) => clearTimeout(t));
+  respawnTimers.length = 0;
+
   labelTimeoutMap.forEach((timer) => clearTimeout(timer));
   labelTimeoutMap.clear();
   labelMap.forEach((label, model) => model.remove(label));
   labelMap.clear();
+  nameTagMap.forEach((label, model) => model.remove(label));
+  nameTagMap.clear();
   if (labelRenderer?.domElement) {
     labelRenderer.domElement.remove();
   }
@@ -982,6 +1209,14 @@ function dispose() {
   });
   pickupItemList = [];
 
+  obstacleMeshes.forEach((mesh) => {
+    scene.remove(mesh);
+    mesh.geometry.dispose();
+    mesh.material.dispose();
+  });
+  obstacleMeshes = [];
+  obstacleList = [];
+
   rippleList.forEach((item) => {
     scene.remove(item.mesh);
     item.mesh.geometry.dispose();
@@ -992,7 +1227,8 @@ function dispose() {
   modelAnimQueue = [];
   moveTargetMap.clear();
   modelWrapList.forEach((wrap) => wrap.mixer.stopAllAction());
-  modelWrapList.length = 0;
+  modelWrapList = [];
+  selectedModel = null;
 
   modelList.forEach((m) => {
     scene.remove(m);
@@ -1004,9 +1240,109 @@ function dispose() {
       }
     });
   });
-  modelList.length = 0;
+  modelList = [];
 }
 
 onMounted(() => init());
 onUnmounted(() => dispose());
 </script>
+
+<style scoped>
+.bot-demo {
+  width: 100%;
+  height: 100%;
+  position: relative;
+  overflow: hidden;
+  background: #e6f4ff;
+  touch-action: none;
+  user-select: none;
+}
+
+.bot-toolbar {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 10;
+  display: flex;
+  gap: 8px;
+}
+
+.bot-toolbar button {
+  padding: 5px 12px;
+  font-size: 0.75rem;
+  border: 1px solid rgba(77, 166, 255, 0.4);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.75);
+  color: #2a6db5;
+  cursor: pointer;
+  backdrop-filter: blur(6px);
+  transition: all 0.2s;
+}
+
+.bot-toolbar button:hover {
+  border-color: #4da6ff;
+  color: #14406e;
+}
+
+.bot-toolbar button.active {
+  background: linear-gradient(135deg, #4da6ff, #7c6cff);
+  border-color: #4da6ff;
+  color: #fff;
+}
+
+.bot-hud {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 10;
+  display: flex;
+  gap: 12px;
+  padding: 6px 14px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.75);
+  border: 1px solid rgba(77, 166, 255, 0.35);
+  backdrop-filter: blur(6px);
+  font-size: 0.78rem;
+  color: #2a6db5;
+}
+
+.bot-hud b {
+  color: #14406e;
+  font-size: 0.9rem;
+}
+
+.bot-loading {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(230, 244, 255, 0.85);
+  color: #2a6db5;
+  font-size: 1rem;
+  z-index: 20;
+  letter-spacing: 0.05em;
+}
+
+/* 持久名牌（CSS2DRenderer 渲染到容器内，需要全局样式） */
+:global(.bot-tag) {
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.82);
+  border: 1px solid rgba(77, 166, 255, 0.5);
+  color: #2a6db5;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: system-ui, sans-serif;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 2px 8px rgba(77, 166, 255, 0.25);
+}
+
+:global(.bot-tag.selected) {
+  background: linear-gradient(135deg, #4da6ff, #7c6cff);
+  border-color: #4da6ff;
+  color: #fff;
+  box-shadow: 0 0 14px rgba(124, 108, 255, 0.55);
+}
+</style>
