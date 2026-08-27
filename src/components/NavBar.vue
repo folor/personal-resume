@@ -1,14 +1,30 @@
 <template>
   <nav class="navbar" :class="{ scrolled: isScrolled }">
     <div class="nav-container">
-      <a href="#hero" class="nav-logo">
+      <a href="/" class="nav-logo" @click.prevent="goHome">
         <span class="logo-icon">YS</span>
         <span class="logo-text">杨素</span>
       </a>
 
       <ul class="nav-links" :class="{ open: menuOpen }">
-        <li v-for="link in links" :key="link.href">
-          <a :href="link.href" @click="menuOpen = false">{{ link.label }}</a>
+        <!-- 首页内锚点（仅在首页路由显示） -->
+        <template v-if="isHome">
+          <li v-for="link in anchorLinks" :key="link.href">
+            <a :href="link.href" @click.prevent="scrollTo(link.href)">{{ link.label }}</a>
+          </li>
+        </template>
+
+        <!-- 路由菜单：工具页 -->
+        <li v-for="r in routeLinks" :key="r.to">
+          <router-link :to="r.to" class="route-link" @click="menuOpen = false">
+            <span class="route-icon">{{ r.icon }}</span>
+            {{ r.label }}
+          </router-link>
+        </li>
+
+        <!-- 工具页显示"返回首页" -->
+        <li v-if="!isHome">
+          <a href="/" class="route-link home-back" @click.prevent="goHome">← 返回首页</a>
         </li>
       </ul>
 
@@ -22,19 +38,47 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+
+const route = useRoute()
+const router = useRouter()
 
 const isScrolled = ref(false)
 const menuOpen = ref(false)
 
-const links = [
-  { label: '首页', href: '#hero' },
+const isHome = computed(() => route.name === 'home')
+
+const anchorLinks = [
   { label: '技术栈', href: '#skills' },
   { label: '经历', href: '#experience' },
   { label: '项目', href: '#projects' },
   { label: '3D Demo', href: '#demo' },
-  { label: '联系', href: '#contact' }
+  { label: '联系', href: '#contact' },
 ]
+
+const routeLinks = [
+  { to: '/agent', label: 'Agent 路线', icon: '🤖' },
+  { to: '/daily', label: '每日打卡', icon: '✅' },
+  { to: '/geo', label: 'GEO 路线', icon: '🔍' },
+]
+
+function scrollTo(href: string) {
+  menuOpen.value = false
+  const el = document.querySelector(href)
+  if (el) el.scrollIntoView({ behavior: 'smooth' })
+}
+
+async function goHome() {
+  menuOpen.value = false
+  if (!isHome.value) {
+    await router.push('/')
+    await nextTick()
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  } else {
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  }
+}
 
 function onScroll() {
   isScrolled.value = window.scrollY > 40
@@ -79,6 +123,7 @@ onUnmounted(() => window.removeEventListener('scroll', onScroll))
   text-decoration: none;
   font-weight: 800;
   font-size: 1.25rem;
+  cursor: pointer;
 }
 
 .logo-icon {
@@ -105,16 +150,16 @@ onUnmounted(() => window.removeEventListener('scroll', onScroll))
 .nav-links {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 4px;
   list-style: none;
 }
 
 .nav-links a {
   display: block;
-  padding: 8px 16px;
+  padding: 8px 14px;
   color: var(--text-secondary);
   text-decoration: none;
-  font-size: 0.95rem;
+  font-size: 0.92rem;
   font-weight: 500;
   border-radius: 8px;
   transition: var(--transition);
@@ -138,8 +183,42 @@ onUnmounted(() => window.removeEventListener('scroll', onScroll))
   color: var(--text-primary);
 }
 
-.nav-links a:hover::after {
+.nav-links a:hover::after,
+.nav-links a.router-link-active::after {
   width: 50%;
+}
+
+/* 路由链接（工具页入口）特殊样式 */
+.route-link {
+  display: inline-flex !important;
+  align-items: center;
+  gap: 5px;
+  background: rgba(77, 166, 255, 0.08);
+  border: 1px solid rgba(77, 166, 255, 0.25);
+}
+
+.route-link:hover {
+  background: rgba(77, 166, 255, 0.18);
+  border-color: var(--accent-blue);
+}
+
+.route-link.router-link-active {
+  background: linear-gradient(135deg, rgba(77, 166, 255, 0.3), rgba(168, 85, 247, 0.25));
+  border-color: var(--accent-blue);
+  color: #fff;
+}
+
+.route-link.router-link-active::after {
+  width: 0;
+}
+
+.route-icon {
+  font-size: 0.85rem;
+}
+
+.home-back {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
 }
 
 .nav-toggle {
@@ -161,14 +240,6 @@ onUnmounted(() => window.removeEventListener('scroll', onScroll))
   transition: var(--transition);
 }
 
-.nav-toggle span:nth-child(1) {
-  transform: rotate(0deg);
-}
-
-.nav-toggle span:nth-child(3) {
-  transform: rotate(0deg);
-}
-
 @media (max-width: 768px) {
   .nav-toggle {
     display: flex;
@@ -180,7 +251,7 @@ onUnmounted(() => window.removeEventListener('scroll', onScroll))
     left: 0;
     right: 0;
     flex-direction: column;
-    gap: 0;
+    gap: 4px;
     background: rgba(10, 14, 26, 0.95);
     backdrop-filter: blur(16px);
     -webkit-backdrop-filter: blur(16px);
@@ -206,10 +277,6 @@ onUnmounted(() => window.removeEventListener('scroll', onScroll))
     display: block;
     padding: 14px 16px;
     border-radius: 10px;
-  }
-
-  .nav-links a:hover {
-    background: rgba(255, 255, 255, 0.05);
   }
 }
 </style>
